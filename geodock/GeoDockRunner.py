@@ -84,16 +84,15 @@ class GeoDockRunner():
 
 
 if __name__ == '__main__':
-    ckpt_file = "weights/dips_0.3.ckpt"
-    partner1 = "./data/test/a9_1a95.pdb1_3.dill_r_b_COMPLEX.pdb"
-    partner2 = "./data/test/a9_1a95.pdb1_3.dill_l_b_COMPLEX.pdb"
+    ckpt_file = "./geodock/weights/dips_0.3.ckpt"
+    partner1 = "./geodock/data/test/a9_1a95.pdb1_3.dill_r_b_COMPLEX.pdb"
+    partner2 = "./geodock/data/test/a9_1a95.pdb1_3.dill_l_b_COMPLEX.pdb"
     out_name = "test"
-
     geodock = GeoDockRunner(ckpt_file=ckpt_file)
     pred = geodock.dock(
         partner1=partner1, 
         partner2=partner2,
         out_name=out_name,
-        do_refine=True,
+        do_refine=False,
         use_openmm=True,
     )
