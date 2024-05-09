@@ -1,9 +1,13 @@
 import hydra
 import torch
 import os
+from pathlib import Path
+
 from omegaconf import DictConfig
 
-@hydra.main(config_path="config/", config_name="config.yaml")
+_root = Path(__file__).parent
+_confdir  = (_root / "config").as_posix()
+@hydra.main(version_base="1.3", config_path=_confdir, config_name="config.yaml")
 def main(config: DictConfig):
     torch.manual_seed(0)
 
