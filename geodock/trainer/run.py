@@ -3,10 +3,6 @@ import torch
 import os
 from omegaconf import DictConfig
 
-#os.environ["WANDB_API_KEY"] = 'bb76c909bdc55c9510c7e47d567c2f6c8a30f369'
-#os.environ["WANDB_MODE"] = "offline"
-
-
 @hydra.main(config_path="config/", config_name="config.yaml")
 def main(config: DictConfig):
     torch.manual_seed(0)
