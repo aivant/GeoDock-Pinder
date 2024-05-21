@@ -32,8 +32,7 @@ class PinderDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        decoy_pdb_folder: str,
-        target_pdb_folder: str,
+        data_root_dir: str,
         raise_exceptions: bool,
         split: str,
         use_bound: bool = False,
@@ -74,9 +73,9 @@ class PinderDataset(torch.utils.data.Dataset):
         """
         super().__init__()
         assert exists(dataframe_path)
+        pdb_folder = os.path.join(data_root_dir, "pdbs")
         self.model_list = ModelListDf(
-            target_pdb_folder=target_pdb_folder,
-            decoy_pdb_folder=decoy_pdb_folder,
+            pdb_folder=pdb_folder,
             df_path=dataframe_path,
             split=split,
             use_bound=use_bound,
@@ -84,8 +83,7 @@ class PinderDataset(torch.utils.data.Dataset):
             limit_clusters=limit_clusters,
         )
         self.raise_exceptions = raise_exceptions
-        self.target_folder = target_pdb_folder
-        self.decoy_folder = decoy_pdb_folder
+        self.pdb_folder = pdb_folder
         self.filter_fn = default(filter_fn, identity)
         self.align_seq_to = align_seqs_to
         self.crop_len = crop_len
@@ -107,34 +105,20 @@ class PinderDataset(torch.utils.data.Dataset):
         example = None
         while example is None:
             (
-                decoy_pdb_paths,
-                target_pdb_paths,
-                decoy_chain_ids,
-                target_chain_ids,
-                exceptions,
+                rec_pdb,
+                lig_pdb,
+                chain_ids,
                 metadata,
             ) = self.model_list[idx]
 
-            # optionally raise exceptions
-            if len(exceptions) > 0:
-                msgs = [str(e) for e in exceptions]
-                print(f"[ERROR] caught exceptions {msgs} loading data")
-                if self.raise_exceptions:
-                    raise exceptions[0]
-            try:
-                example = self.load_example(
-                    decoy_pdb_paths,
-                    target_pdb_paths,
-                    decoy_chain_ids,
-                    target_chain_ids,
-                    metadata,
-                )
-                example = example if self.filter_fn(example) else None
+            example = self.load_example(
+                rec_pdb,
+                lig_pdb,
+                chain_ids,
+                metadata,
+            )
+            example = example if self.filter_fn(example) else None
 
-            except Exception as e:  # noqa
-                print(f"[Warning] Got exception : {e} in dataloader")
-                if self.raise_exceptions:
-                    raise e
             # load another example at random
             idx = randint(0, len(self) - 1)
 
@@ -154,12 +138,28 @@ class PinderDataset(torch.utils.data.Dataset):
         """
         # load coords, seqs, compute embs. that's all.
         data = {}
-        decoy_pbd_files = [pdb.PDBFile.read(decoy_pdb_path) for decoy_pdb_path in decoy_pdb_paths]
-        target_pbd_files = [pdb.PDBFile.read(target_pdb_path) for target_pdb_path in target_pdb_paths]
-        data["decoy"] = [pdb.get_structure(decoy_pdb_file, model=1) for decoy_pdb_file in decoy_pbd_files]
-        data["target"] = [pdb.get_structure(target_pdb_file, model=1) for target_pdb_file in target_pbd_files]
-        data["decoy"] = [data["decoy"][data["decoy"].chain_id == decoy_chain_id] for decoy_chain_id in decoy_chain_ids]
-        data["target"] = [data["target"][data["target"].chain_id == target_chain_id] for target_chain_id in target_chain_ids]
+        decoy_pbd_files = [
+            pdb.PDBFile.read(decoy_pdb_path) for decoy_pdb_path in decoy_pdb_paths
+        ]
+        target_pbd_files = [
+            pdb.PDBFile.read(target_pdb_path) for target_pdb_path in target_pdb_paths
+        ]
+        data["decoy"] = [
+            pdb.get_structure(decoy_pdb_file, model=1)
+            for decoy_pdb_file in decoy_pbd_files
+        ]
+        data["target"] = [
+            pdb.get_structure(target_pdb_file, model=1)
+            for target_pdb_file in target_pbd_files
+        ]
+        data["decoy"] = [
+            data["decoy"][data["decoy"].chain_id == decoy_chain_id]
+            for decoy_chain_id in decoy_chain_ids
+        ]
+        data["target"] = [
+            data["target"][data["target"].chain_id == target_chain_id]
+            for target_chain_id in target_chain_ids
+        ]
         return data
 
     @property
@@ -203,17 +203,15 @@ def collate(batch: List[Optional[Dict]]) -> List[Dict]:
 class ModelListDf:
     def __init__(
         self,
+        pdb_folder: str,
         df_path: str,
-        decoy_pdb_folder: str,
-        target_pdb_folder: str,
         split: str,
         use_bound: bool = False,
         monomer_ty: str = "holo",
         limit_clusters: int = -1,
         raise_exceptions: bool = True,
     ):
-        self.target_pdb_folder = target_pdb_folder
-        self.decoy_pdb_folder = decoy_pdb_folder
+        self.pdb_folder = pdb_folder
         self.use_bound = use_bound
         if df_path.endswith(".parquet"):
             index = pd.read_parquet(df_path)
@@ -267,32 +265,13 @@ class ModelListDf:
 
     def __getitem__(self, idx):
         rec, lig, meta = self.sample(index=idx, split=self.clusters)
-        tgt_fldr, decoy_fldr = self.target_pdb_folder, self.decoy_pdb_folder
-        if "subfolder" in meta:
-            tgt_fldr, decoy_fldr = map(
-                lambda x: os.path.join(x, meta["subfolder"]), (tgt_fldr, decoy_fldr)
-            )
-        decoy_pdbs = list(map(lambda x: os.path.join(decoy_fldr, x), [rec, lig]))
-        decoy_pdbs = list(
-            map(lambda x: x if x.endswith("pdb") else f"{x}.pdb", decoy_pdbs)
-        )
-        target_pdbs = list(
-            map(
-                lambda x: os.path.join(tgt_fldr, x),
-                [f"{meta['id']}.pdb", f"{meta['id']}.pdb"],
-            )
-        )
-        decoy_chains, target_chains = ["R", "L"], ["R", "L"]
+        rec_pdb = os.path.join(self.pdb_folder, rec)
+        lig_pdb = os.path.join(self.pdb_folder, lig)
+        chains = ["R", "L"]
         exceptions = []
-        for path in decoy_pdbs + target_pdbs:
-            try:
-                assert os.path.exists(path)
-            except Exception as e:
-                exceptions.append(e)
-        if self.raise_exceptions and len(exceptions):
-            print(f"failing with {len(exceptions)} exceptions")
-            raise exceptions[0]
-        return decoy_pdbs, target_pdbs, decoy_chains, target_chains, exceptions, meta
+        for path in [rec_pdb, lig_pdb]:
+            assert os.path.exists(path)
+        return rec_pdb, lig_pdb, chains, meta
 
     def __len__(self):
         return len(self.clusters)
