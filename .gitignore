@@ -179,5 +179,5 @@ deploy_keys/
 plots/
 inference/
 trainer/
-
+outputs/
 sandbox/
