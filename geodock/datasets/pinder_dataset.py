@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.utils.data
 from biotite.structure.io import pdb
+from esm.inverse_folding.util import load_coords
 
 
 def exists(x: Any) -> bool:
@@ -20,7 +21,7 @@ def exists(x: Any) -> bool:
 
 def default(x: Any, y: Any) -> Any:
     """Returns x if x exists, otherwise y"""
-    x = x if exists(x) else y
+    return x if exists(x) else y
 
 
 def identity(x):
@@ -35,63 +36,23 @@ class PinderDataset(torch.utils.data.Dataset):
         data_root_dir: str,
         raise_exceptions: bool,
         split: str,
-        use_bound: bool = False,
         dataframe_path: Optional[str] = None,
-        align_seqs_to: str = "decoy",
         filter_fn: Optional[Any] = None,
         crop_len: int = -1,
         max_seq_len: int = -1,
-        kabsch_align_chains: bool = True,
-        load_monomer_ty: Literal["apo", "holo", "predicted", "all"] = "holo",
-        limit_clusters: int = -1,
     ):
-        """PDB Dataset
-
-        Args:
-            decoy_pdb_folder (str): root directory containing all decoy
-                pdb files.
-
-            target_pdb_folder (str): root directory containing all target
-                pdb files.
-
-            pdb_list_path (Optional[str]): path to list of pdb files to load
-                (see `dataset_utils.load_pdb_list` for a description)
-
-            cluster_list_path (Optional[str]): path to list of cluster files to load
-                (see `dataset_utils.load_cluster_list` for a description)
-
-            cluster_folder (Optional[str]): root directory containing cluster files
-
-            raise_exceptions (bool): whether to raise or ignore exceptions
-
-            align_seqs_to (str, optional): whether to align examples to sequences
-                derived from "target" or "decoy" pdbs. Defaults to "target".
-
-            filter_fn (Optional[Any], optional): function taking an example as
-                input, and returning a boolean indicating whether the example is valid
-                and should be passed ot the model. Defaults to None.
-        """
         super().__init__()
         assert exists(dataframe_path)
         pdb_folder = os.path.join(data_root_dir, "pdbs")
         self.model_list = ModelListDf(
-            pdb_folder=pdb_folder,
-            df_path=dataframe_path,
-            split=split,
-            use_bound=use_bound,
-            monomer_ty=load_monomer_ty,
-            limit_clusters=limit_clusters,
+            pdb_folder=pdb_folder, df_path=dataframe_path, split=split
         )
-        self.raise_exceptions = raise_exceptions
         self.pdb_folder = pdb_folder
         self.filter_fn = default(filter_fn, identity)
-        self.align_seq_to = align_seqs_to
         self.crop_len = crop_len
-        self.kabsch_align_chains = kabsch_align_chains
         self.max_seq_len = max_seq_len
-        self.load_monomer_ty = load_monomer_ty
 
-    def subset(self, start, end):
+    def subset(self, start: int, end: int):
         if isinstance(start, float) and end <= 1:
             start = int(start * len(self))
             end = int(end * len(self))
@@ -102,8 +63,8 @@ class PinderDataset(torch.utils.data.Dataset):
         return len(self.model_list)
 
     def __getitem__(self, idx: int) -> Optional[Dict]:
-        example = None
-        while example is None:
+        item = None
+        while item is None:
             (
                 rec_pdb,
                 lig_pdb,
@@ -111,93 +72,35 @@ class PinderDataset(torch.utils.data.Dataset):
                 metadata,
             ) = self.model_list[idx]
 
-            example = self.load_example(
-                rec_pdb,
-                lig_pdb,
-                chain_ids,
-                metadata,
-            )
-            example = example if self.filter_fn(example) else None
+            item = self.load_item(rec_pdb, lig_pdb, chain_ids, metadata)
+            item = item if self.filter_fn(item) else None
 
             # load another example at random
             idx = randint(0, len(self) - 1)
 
-        example = align_chains(example) if self.kabsch_align_chains else example
-        return example
+        return item
 
-    def load_example(
+    def load_item(
         self,
-        decoy_pdb_paths: List[Path],
-        target_pdb_paths: List[Path],
-        decoy_chain_ids: List[str],
-        target_chain_ids: List[str],
-        metadata: Dict,
+        rec_pdb: str,
+        lig_pdb: str,
+        chain_ids: List[str],
+        metadata: dict,
     ) -> Dict:
         """
         Loads a single example from the dataset.
         """
-        # load coords, seqs, compute embs. that's all.
+        # load coords, seqs, compute embs
         data = {}
-        decoy_pbd_files = [
-            pdb.PDBFile.read(decoy_pdb_path) for decoy_pdb_path in decoy_pdb_paths
-        ]
-        target_pbd_files = [
-            pdb.PDBFile.read(target_pdb_path) for target_pdb_path in target_pdb_paths
-        ]
-        data["decoy"] = [
-            pdb.get_structure(decoy_pdb_file, model=1)
-            for decoy_pdb_file in decoy_pbd_files
-        ]
-        data["target"] = [
-            pdb.get_structure(target_pdb_file, model=1)
-            for target_pdb_file in target_pbd_files
-        ]
-        data["decoy"] = [
-            data["decoy"][data["decoy"].chain_id == decoy_chain_id]
-            for decoy_chain_id in decoy_chain_ids
-        ]
-        data["target"] = [
-            data["target"][data["target"].chain_id == target_chain_id]
-            for target_chain_id in target_chain_ids
-        ]
+        rec_coords, rec_seq = load_coords(rec_pdb, chain_ids[0])
+        lig_coords, lig_seq = load_coords(lig_pdb, chain_ids[1])
+        data["receptor"] = {"coords": rec_coords, "seq": rec_seq}
+        data["ligand"] = {"coords": lig_coords, "seq": lig_seq}
+
+        # compute embeddings here? or preprocess?
+
+        data["metadata"] = metadata
         return data
-
-    @property
-    def collate_fn(self):
-        return partial(
-            default_collate,
-            max_len=self.crop_len,
-            atom_idx=1,
-        )
-
-
-def align_chains(example: Dict):
-    atom_tys = example["metadata"]["atom_tys"]
-    bb_atom_posns = data_utils._backbone_atom_tensor(tuple(atom_tys))
-    bb_atom_mask = torch.nn.functional.one_hot(bb_atom_posns, len(atom_tys))
-    bb_atom_mask = torch.sum(bb_atom_mask, dim=0).bool()
-    for i in range(len(example["decoy"]["coordinates"])):
-        # align on common backbone atoms and residues
-        decoy_atom_mask = example["decoy"]["atom_mask"][i]
-        target_atom_mask = example["target"]["atom_mask"][i]
-        decoy_residue_mask = example["decoy"]["residue_mask"][i]
-        target_residue_mask = example["target"]["residue_mask"][i]
-        alignment_residue_mask = decoy_residue_mask & target_residue_mask
-        alignment_atom_mask = decoy_atom_mask & target_atom_mask
-        # align onlly on valid backbone atoms
-        alignment_atom_mask[..., ~bb_atom_mask] = False
-
-        example["decoy"]["coordinates"][i] = fa_align(
-            mobile=example["decoy"]["coordinates"][i],
-            target=example["target"]["coordinates"][i],
-            atom_mask=alignment_atom_mask,
-            align_mask=alignment_residue_mask,
-        )
-    return example
-
-
-def collate(batch: List[Optional[Dict]]) -> List[Dict]:
-    return list(filter(exists, batch))
 
 
 class ModelListDf:
@@ -206,13 +109,8 @@ class ModelListDf:
         pdb_folder: str,
         df_path: str,
         split: str,
-        use_bound: bool = False,
-        monomer_ty: str = "holo",
-        limit_clusters: int = -1,
-        raise_exceptions: bool = True,
     ):
         self.pdb_folder = pdb_folder
-        self.use_bound = use_bound
         if df_path.endswith(".parquet"):
             index = pd.read_parquet(df_path)
         else:
@@ -229,14 +127,10 @@ class ModelListDf:
         clusterlists = []
         for i, cluster_id in enumerate(clusters[split]):
             clusterlists.append(clusters[split][cluster_id])
-        self.clusters = self.filter_rows_by_monomer_ty(clusterlists, monomer_ty)
-        if limit_clusters > 0:
-            shuffle(self.clusters)
-            self.clusters = self.clusters[:limit_clusters]
-        self.monomer_ty = monomer_ty
-        self.raise_exceptions = raise_exceptions
+        self.clusters = self.filter_rows_by_monomer_ty(clusterlists, monomer_ty="holo")
+        self.monomer_ty = "holo"
 
-    def filter_rows_by_monomer_ty(self, clusterlists, monomer_ty):
+    def filter_rows_by_monomer_ty(self, clusterlists: List[List[Dict]], monomer_ty: str):
         if monomer_ty == "all":
             return clusterlists
         filtered_rows = []
@@ -250,11 +144,11 @@ class ModelListDf:
                 filtered_rows.append(filtered_cluster)
         return filtered_rows
 
-    def restrict(self, start, end):
+    def restrict(self, start: int, end: int):
         self.clusters = self.clusters[start:end]
         return self
 
-    def sample(self, index, split):
+    def sample(self, index: int, split: List[List[Dict]]):
         df_row = split[index][np.random.choice(len(split[index]))]
         rec_pdb = df_row[f"{self.monomer_ty}_R_pdb"]
         lig_pdb = df_row[f"{self.monomer_ty}_L_pdb"]
@@ -263,7 +157,7 @@ class ModelListDf:
         metadata["ligand_ty"] = self.monomer_ty
         return rec_pdb, lig_pdb, metadata
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         rec, lig, meta = self.sample(index=idx, split=self.clusters)
         rec_pdb = os.path.join(self.pdb_folder, rec)
         lig_pdb = os.path.join(self.pdb_folder, lig)
